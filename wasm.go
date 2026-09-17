@@ -32,6 +32,7 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
 // ErrNoFunc means the module did not export the name a caller asked for.
@@ -48,6 +49,23 @@ type Limits struct {
 	// interruptible from outside except by cancelling its context, so this is
 	// what stops one from holding a goroutine forever.
 	Run time.Duration
+	// NoWASI declines the WASI preview 1 interface, which New otherwise grants.
+	//
+	// The default is ON, and that is a deliberate reversal of "capabilities are
+	// opt-in". A Rust cdylib built for wasm32-wasip1 imports
+	// wasi_snapshot_preview1 through std whether or not the code calls it, so a
+	// module that never touches a file still refuses to instantiate without it —
+	// and the error names the missing module rather than the reason, which is a
+	// afternoon lost to a panic that has nothing to do with the guest.
+	//
+	// It costs little to grant: wazero starts WASI with nothing mounted, so the
+	// fd calls exist and reach nothing. There is no filesystem and no network
+	// behind it. Reaching the outside stays the Store's job, where the host holds
+	// the credential.
+	//
+	// Set this only for a guest that genuinely imports nothing — a hand-written
+	// module, or one from a toolchain that targets wasm32-unknown-unknown.
+	NoWASI bool
 }
 
 const (
@@ -80,9 +98,20 @@ type Engine struct {
 
 // New compiles nothing yet; it prepares the runtime a Module will compile into.
 // The returned Engine owns host resources and must be Closed.
-func New(ctx context.Context, l Limits) *Engine {
+//
+// It grants WASI unless Limits.NoWASI says otherwise, because almost every
+// guest needs it to instantiate at all and nobody should have to learn that from
+// a panic. See Limits.NoWASI.
+func New(ctx context.Context, l Limits) (*Engine, error) {
 	cfg := wazero.NewRuntimeConfig().WithMemoryLimitPages(l.pages())
-	return &Engine{rt: wazero.NewRuntimeWithConfig(ctx, cfg), limits: l}
+	rt := wazero.NewRuntimeWithConfig(ctx, cfg)
+	if !l.NoWASI {
+		if _, err := wasi_snapshot_preview1.Instantiate(ctx, rt); err != nil {
+			_ = rt.Close(ctx)
+			return nil, fmt.Errorf("wasm: wasi: %w", err)
+		}
+	}
+	return &Engine{rt: rt, limits: l}, nil
 }
 
 // Close releases the runtime and every module compiled into it.
@@ -126,6 +155,19 @@ func (m *Module) Start(ctx context.Context) (*Instance, error) {
 
 // Close frees the sandbox. Every Start needs one.
 func (i *Instance) Close(ctx context.Context) error { return i.mod.Close(ctx) }
+
+// Memory is the guest's linear memory, which is how bulk data crosses the
+// boundary in the direction the Store does not cover.
+//
+// Call takes and returns integers, because that is all a wasm signature can
+// carry. Anything larger travels as (ptr,len) into this, so a host handing a
+// guest a git object writes the bytes here and passes their address. It is the
+// same mechanism the host functions use in reverse.
+//
+// It is the WHOLE sandbox and nothing outside it: a write lands in this
+// instance's memory and no other, which is what makes an instance per caller
+// the isolation unit rather than a convention.
+func (i *Instance) Memory() api.Memory { return i.mod.Memory() }
 
 // Call invokes an exported function under the engine's Run bound.
 //

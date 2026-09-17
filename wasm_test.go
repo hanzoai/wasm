@@ -24,7 +24,10 @@ var addWasm = []byte{
 func engine(t *testing.T) (*wasm.Engine, *wasm.Module) {
 	t.Helper()
 	ctx := context.Background()
-	e := wasm.New(ctx, wasm.Limits{})
+	e, err := wasm.New(ctx, wasm.Limits{})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
 	t.Cleanup(func() { _ = e.Close(ctx) })
 	m, err := e.Compile(ctx, addWasm)
 	if err != nil {
@@ -113,7 +116,10 @@ func TestMissingExportIsNamed(t *testing.T) {
 // most often ships, so it is the one that has to be safe.
 func TestZeroLimitsAreBounded(t *testing.T) {
 	ctx := context.Background()
-	e := wasm.New(ctx, wasm.Limits{})
+	e, err := wasm.New(ctx, wasm.Limits{})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
 	defer e.Close(ctx)
 	m, err := e.Compile(ctx, addWasm)
 	if err != nil {
@@ -131,9 +137,71 @@ func TestZeroLimitsAreBounded(t *testing.T) {
 
 func TestBadBytesDoNotPanic(t *testing.T) {
 	ctx := context.Background()
-	e := wasm.New(ctx, wasm.Limits{Run: time.Second})
+	e, err := wasm.New(ctx, wasm.Limits{Run: time.Second})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
 	defer e.Close(ctx)
 	if _, err := e.Compile(ctx, []byte{0x00, 0x01, 0x02}); err == nil {
 		t.Fatal("garbage compiled without error")
+	}
+}
+
+// The default must run a Rust guest. A cdylib built for wasm32-wasip1 imports
+// wasi_snapshot_preview1 through std whether or not the code calls it, so the
+// zero Limits has to satisfy that import — this is the case that used to fail
+// with "module[wasi_snapshot_preview1] not instantiated" and send people
+// reading their own guest for a fault that was in the host.
+func TestDefaultSatisfiesWASIImport(t *testing.T) {
+	ctx := context.Background()
+	e, err := wasm.New(ctx, wasm.Limits{})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer e.Close(ctx)
+	// (module (import "wasi_snapshot_preview1" "proc_exit" (func (param i32))) (memory 1))
+	src := []byte{
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+		0x01, 0x7f, 0x00, 0x02, 0x24, 0x01, 0x16, 0x77, 0x61, 0x73, 0x69, 0x5f,
+		0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x70, 0x72, 0x65,
+		0x76, 0x69, 0x65, 0x77, 0x31, 0x09, 0x70, 0x72, 0x6f, 0x63, 0x5f, 0x65,
+		0x78, 0x69, 0x74, 0x00, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01, 0x00, 0x0e,
+		0x04, 0x6e, 0x61, 0x6d, 0x65, 0x01, 0x07, 0x01, 0x00, 0x04, 0x65, 0x78,
+		0x69, 0x74,
+	}
+	m, err := e.Compile(ctx, src)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	in, err := m.Start(ctx)
+	if err != nil {
+		t.Fatalf("a default engine must satisfy the WASI import: %v", err)
+	}
+	_ = in.Close(ctx)
+}
+
+// And NoWASI must actually decline it, or the opt-out is decoration.
+func TestNoWASIDeclines(t *testing.T) {
+	ctx := context.Background()
+	e, err := wasm.New(ctx, wasm.Limits{NoWASI: true})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer e.Close(ctx)
+	src := []byte{
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+		0x01, 0x7f, 0x00, 0x02, 0x24, 0x01, 0x16, 0x77, 0x61, 0x73, 0x69, 0x5f,
+		0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x70, 0x72, 0x65,
+		0x76, 0x69, 0x65, 0x77, 0x31, 0x09, 0x70, 0x72, 0x6f, 0x63, 0x5f, 0x65,
+		0x78, 0x69, 0x74, 0x00, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01, 0x00, 0x0e,
+		0x04, 0x6e, 0x61, 0x6d, 0x65, 0x01, 0x07, 0x01, 0x00, 0x04, 0x65, 0x78,
+		0x69, 0x74,
+	}
+	m, err := e.Compile(ctx, src)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if _, err := m.Start(ctx); err == nil {
+		t.Fatal("NoWASI still satisfied the WASI import")
 	}
 }

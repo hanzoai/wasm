@@ -53,7 +53,10 @@ func (s *mem) List(_ context.Context, pfx string) ([]string, error) {
 // and instantiates many guests afterwards.
 func TestBindBeforeAnyGuest(t *testing.T) {
 	ctx := context.Background()
-	e := wasm.New(ctx, wasm.Limits{})
+	e, err := wasm.New(ctx, wasm.Limits{})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
 	defer e.Close(ctx)
 	if err := e.Bind(ctx, newMem()); err != nil {
 		t.Fatalf("bind: %v", err)
@@ -66,7 +69,10 @@ func TestBindBeforeAnyGuest(t *testing.T) {
 // compile time.
 func TestGuestImportsResolve(t *testing.T) {
 	ctx := context.Background()
-	e := wasm.New(ctx, wasm.Limits{})
+	e, err := wasm.New(ctx, wasm.Limits{})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
 	defer e.Close(ctx)
 	if err := e.Bind(ctx, newMem()); err != nil {
 		t.Fatalf("bind: %v", err)
@@ -94,7 +100,10 @@ func TestGuestImportsResolve(t *testing.T) {
 // preventing: it would look sandboxed and do nothing.
 func TestUnboundHostIsRefused(t *testing.T) {
 	ctx := context.Background()
-	e := wasm.New(ctx, wasm.Limits{})
+	e, err := wasm.New(ctx, wasm.Limits{})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
 	defer e.Close(ctx)
 	src := []byte{
 		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
