@@ -36,12 +36,33 @@ orders of magnitude rather than constants.
 **Here:** pure computation on data you hand it — transforms, scoring, policy,
 untrusted snippets, anything expressible as a function.
 
-**Not here:** work that needs a kernel. WASI has no process spawn — no `fork`,
-no `exec`, in preview 1 or the component model — so a guest cannot run `git`,
-`pytest`, `pip` or `cargo`. That is not a gap to work around; it is the property
-that makes the sandbox cheap. Work needing a real OS runs under **Visor**
-(`runtimeClassName: visor`), which is a different question with a different
-answer.
+**Not here:** work that must run somebody else's binary. WASI has no process
+spawn, so a guest cannot `exec` `pytest` or `cargo build`. Work that genuinely
+needs a kernel runs under **Visor** (`runtimeClassName: visor`).
+
+But "needs a kernel" is a smaller set than it first looks, and `Store` is why.
+
+## Reaching the outside: `Store`
+
+A guest that shells out to `git` needs `exec` and cannot run here. A guest handed
+an object store does not — a repository IS objects, a read is `Get`, a write is
+`Put`, and the network hop happens on the HOST side where the credential already
+lives:
+
+```go
+e.Bind(ctx, s3)   // hanzoai/s3 over ZAP in the fleet, a map in a test
+```
+
+The guest imports one module, `hanzo`, with `get`/`put`/`list`. It names keys,
+never hosts, and holds no credential it could leak. Nothing is spawned because
+nothing needs to be — which is what makes S3-backed agentic work possible at
+sandbox prices rather than container prices.
+
+The wire is a key as `(ptr,len)` and a result written into guest-allocated
+memory. No JSON crosses the boundary: bytes and two integers is the cheapest
+thing that can cross, and the only shape that cannot disagree about a schema. A
+guest that wants results exports `alloc(i32) i32`; one that does not gets
+`ErrNoAlloc` rather than a silent truncation.
 
 ## Limits
 
