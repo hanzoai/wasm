@@ -111,3 +111,86 @@ guest's fault, and sends people reading their own code.
 It grants nothing much: wazero starts WASI with nothing mounted, so the fd calls
 exist and reach nothing. No filesystem, no network. `Limits{NoWASI: true}`
 declines it for a guest that genuinely imports nothing.
+
+## It runs real compilers: `compile`
+
+`wasm` runs a guest. `compile` is the host for the case where the guest is a
+compiler — one registry, two roles, one diagnostic shape:
+
+```go
+c, _ := compile.NewTSGo(ctx, compile.Config{
+    Blob:  compile.Blob{Path: "tsgo.wasm", Sum: "b17624…"},
+    Cache: "/var/cache/hanzo/wazero",
+})
+compile.Register(c)
+
+diags, _ := c.Check(ctx, compile.Project{
+    Root:  "/project",
+    Entry: []string{"entry.ts"},
+    Files: compile.Map{"entry.ts": src, "math.ts": more},
+}, compile.Options{})
+// entry.ts:2:14 error TS2322 Type 'number' is not assignable to type 'string'.
+```
+
+A checker is registered, not endpointed. Supporting Rust is a row rather than a
+route, and `Checkers()` is how an agent learns what can be checked here instead
+of hardcoding a list.
+
+`Checker` and `Bundler` are separate interfaces because most checkers do not
+bundle. esbuild bundles `const wrong: string = add(1,2)` and exits 0, so it
+registers as a `Bundler` and only that — asking for `CheckerNamed("esbuild")`
+gets nothing, which is the registry refusing to claim source was verified when
+it was not.
+
+### A project is files, not a path
+
+`Project.Files` is a host callback: `ReadFile`, `FileExists`, `DirExists`,
+`Entries`, `Realpath`. There is no disk path in it. The repository lives in s3,
+the host answers reads out of its own cache, and the guest reaches exactly what
+the host answers for and nothing else. `Map` is the in-memory implementation a
+test uses and the shape a warm cache takes.
+
+esbuild needs no filesystem at all: its plugin protocol carries every resolve
+and load, so the module runs with **zero preopened directories**. tsgo issues
+ordinary WASI reads — porting a compiler off a filesystem would mean forking it
+— so its mount is an `fs.FS` backed by the same callbacks. Either way the answer
+comes from a function, and a project with no `tsconfig.json` gets one that
+exists only in the guest's view of the tree.
+
+### One diagnostic shape
+
+`{file, line, column, severity, code, message, checker}`, lines and columns
+1-based because every compiler in the set already reports that way. esbuild's
+column counts bytes from 0; that translation happens here, once, rather than in
+every caller. An agent that reads a `TS2322` reads an `E0308` with no new code.
+
+### What it costs
+
+tsgo is a command module: `_start` runs `main()` and exits, so every check
+re-parses the standard library, and that parse is the bill. Measured on evo
+(x86_64, 32 cores, 2026-09-17) over a two-file project:
+
+| | wall | memory |
+|---|---|---|
+| default libs, one check | 1.7 s | 795 MB |
+| `lib: ["es2022"]`, `types: []` | 273 ms | 430 MB |
+| eight at once, `GOMEMLIMIT=256MiB` | 541 ms | 895 MB total |
+
+So es2022 with no ambient types is the default here, `GOMEMLIMIT` is set per
+check, and one `CompiledModule` is instantiated many times — eight concurrent
+checks at 68 ms each. Compiling the module itself costs ~12 s, which is why
+`Config.Cache` is a directory: reading 49 MB of machine code back is ~300 ms.
+`go test -bench .` prints cold, warm and eight-at-once for the host it runs on.
+
+Above that fleet size the numbers turn: sixteen instances of the default-lib
+module cost 5.0 s and 4.07 GB. ~290 MB per instance is the budget, and the
+structural fix is a reactor — a live instance holding a parsed library that
+answers per-edit checks — not more instances.
+
+### The modules are not in this repository
+
+tsgo is 49 MB and esbuild 20 MB. `Blob` names one by path or URL **and** its
+sha256; a blob with no digest is refused rather than trusted. The tests want
+`TSGO_WASM` and `ESBUILD_WASM` pointing at local builds, with `TSGO_SHA256` and
+`ESBUILD_SHA256` to pin them; without those they skip and say which one is
+missing.
