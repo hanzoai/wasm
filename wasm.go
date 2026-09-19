@@ -45,9 +45,10 @@ type Limits struct {
 	// 16 MiB) rather than meaning "unlimited" — the useful reading of an unset
 	// bound is a modest one, not an absent one.
 	Pages uint32
-	// Run bounds a single call. 0 takes the default (5s). A guest loop is not
-	// interruptible from outside except by cancelling its context, so this is
-	// what stops one from holding a goroutine forever.
+	// Run bounds a single call, and the start function Start runs. 0 takes the
+	// default (5s). A guest loop is not interruptible from outside except by
+	// cancelling its context, so this is what stops one from holding a goroutine
+	// forever. It stops loops and nothing else; see New.
 	Run time.Duration
 	// NoWASI declines the WASI preview 1 interface, which New otherwise grants.
 	//
@@ -109,6 +110,10 @@ func New(ctx context.Context, l Limits) (*Engine, error) {
 	// native code that neither a context nor the collector can interrupt, and a
 	// collection that waits on a guest that never returns stops every
 	// goroutine in the process.
+	//
+	// Loops are the only place wazero checks. A guest that runs long through
+	// recursion alone, with no loop in it, stays native code until it returns:
+	// Run does not stop it, and a collection waits on it as above.
 	cfg := wazero.NewRuntimeConfig().WithMemoryLimitPages(l.pages()).WithCloseOnContextDone(true)
 	rt := wazero.NewRuntimeWithConfig(ctx, cfg)
 	if !l.NoWASI {
@@ -146,8 +151,12 @@ type Instance struct {
 	lim Limits
 }
 
-// Start instantiates the module into a fresh sandbox.
+// Start instantiates the module into a fresh sandbox. A start function, or
+// _start in a command module, runs before it returns, so Run bounds it as it
+// bounds a Call.
 func (m *Module) Start(ctx context.Context) (*Instance, error) {
+	ctx, cancel := context.WithTimeout(ctx, m.eng.limits.run())
+	defer cancel()
 	// An anonymous name, deliberately: a named module registers in the runtime
 	// and a second instantiation under the same name fails. Callers want many
 	// live sandboxes of one module, which is the ordinary case and must not
@@ -177,14 +186,14 @@ func (i *Instance) Memory() api.Memory { return i.mod.Memory() }
 
 // Call invokes an exported function under the engine's Run bound.
 //
-// The deadline is applied HERE rather than at Start because it bounds a call,
-// not a sandbox: an instance may sit idle for as long as its caller likes, and
-// only a running guest can hang.
+// The deadline bounds a call, not a sandbox: an instance may sit idle for as
+// long as its caller likes, and only a running guest can hang.
 //
-// A call its context ends, by Run or by the caller, is stopped where it stands
-// and closes the instance, which cannot pick up what the guest left half done.
-// The error matches context.DeadlineExceeded or context.Canceled with
-// errors.Is, and every later call on the instance answers that it is closed.
+// A call its context ends, by Run or by the caller, stops at the guest's next
+// loop iteration and closes the instance, which cannot pick up what the guest
+// left half done. The error matches context.DeadlineExceeded or
+// context.Canceled with errors.Is, and every later call on the instance
+// answers that it is closed.
 func (i *Instance) Call(ctx context.Context, name string, args ...uint64) ([]uint64, error) {
 	fn := i.mod.ExportedFunction(name)
 	if fn == nil {

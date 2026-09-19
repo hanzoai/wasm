@@ -67,11 +67,20 @@ guest that wants results exports `alloc(i32) i32`; one that does not gets
 ## Limits
 
 The zero value is bounded, not unlimited: 256 pages (16 MiB) and a 5s ceiling on
-one call. An unset bound is the case most callers ship, so it is the one that has
-to be safe. A guest loop is not interruptible from outside except by cancelling
-its context, which is what `Run` does. A call stopped that way closes its
-instance, and the error matches `context.DeadlineExceeded` or
-`context.Canceled`.
+one call, or on the start function `Start` runs. An unset bound is the case most
+callers ship, so it is the one that has to be safe.
+
+A guest loop is not interruptible from outside except by cancelling its context,
+which is what `Run` does, and what the caller's own cancellation does sooner. A
+call stopped that way closes its instance, and the error matches
+`context.DeadlineExceeded` or `context.Canceled`. For the cancellation to reach a
+running guest, wazero checks for it on every loop iteration: ~22 ns each on an M1
+Max, so a loop that does little else runs ~65× slower. The gitoxide timings below
+predate that check.
+
+Loops are the only place wazero checks. A guest that runs long through recursion
+alone — `f(n) = f(n-1) + f(n-1)`, no loop anywhere — is not stopped by `Run`, and
+it holds the next garbage collection, and so the process, until it returns.
 
 ## Naming
 

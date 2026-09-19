@@ -136,12 +136,14 @@ func TestZeroLimitsAreBounded(t *testing.T) {
 	}
 }
 
-// spin.wasm: (func (export "spin") (loop (br 0))), a guest that never returns.
+// spin.wasm: (func (export "spin") (loop (br 0))), a guest that never returns,
+// and (func (export "one") (result i32) (i32.const 1)), a call that always does.
 var spinWasm = []byte{
-	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60,
-	0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x08, 0x01, 0x04, 0x73, 0x70,
-	0x69, 0x6e, 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x03, 0x40, 0x0c,
-	0x00, 0x0b, 0x0b,
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60,
+	0x00, 0x00, 0x60, 0x00, 0x01, 0x7f, 0x03, 0x03, 0x02, 0x00, 0x01, 0x07,
+	0x0e, 0x02, 0x04, 0x73, 0x70, 0x69, 0x6e, 0x00, 0x00, 0x03, 0x6f, 0x6e,
+	0x65, 0x00, 0x01, 0x0a, 0x0e, 0x02, 0x07, 0x00, 0x03, 0x40, 0x0c, 0x00,
+	0x0b, 0x0b, 0x04, 0x00, 0x41, 0x01, 0x0b,
 }
 
 // A guest that never returns is stopped by Run, or sooner by the caller's own
@@ -199,6 +201,85 @@ func TestRunStopsAGuestThatNeverReturns(t *testing.T) {
 	cancel()
 	if err := answer(spin(cancelled)); !errors.Is(err, context.Canceled) {
 		t.Errorf("a cancelled context answered %v", err)
+	}
+}
+
+// watch waits for a guest that may never come back. The watchdog sits far past
+// any bound under test, so it fires only when the bound did nothing.
+func watch(t *testing.T, run func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- run() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("the guest was still running 5s later")
+		return nil
+	}
+}
+
+// A guest stopped mid-call left its memory in whatever state the call reached,
+// so the instance is closed rather than handed back half run: a call that a
+// live instance answers at once is refused.
+func TestStoppedInstanceIsClosed(t *testing.T) {
+	ctx := context.Background()
+	e, err := wasm.New(ctx, wasm.Limits{Run: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer e.Close(ctx)
+	m, err := e.Compile(ctx, spinWasm)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	in, err := m.Start(ctx)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer in.Close(ctx)
+	if out, err := in.Call(ctx, "one"); err != nil || out[0] != 1 {
+		t.Fatalf("a live instance answered one() with %v %v", out, err)
+	}
+	err = watch(t, func() error {
+		_, err := in.Call(ctx, "spin")
+		return err
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want the Run deadline, got %v", err)
+	}
+	if _, err := in.Call(ctx, "one"); err == nil {
+		t.Fatal("a stopped instance ran another call")
+	}
+}
+
+// A guest runs during Start as well: a start function, or _start in a command
+// module, executes before Start returns. Run bounds that too.
+func TestRunStopsASpinningStart(t *testing.T) {
+	ctx := context.Background()
+	e, err := wasm.New(ctx, wasm.Limits{Run: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer e.Close(ctx)
+	// (module (func (loop (br 0))) (start 0))
+	m, err := e.Compile(ctx, []byte{
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60,
+		0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x08, 0x01, 0x00, 0x0a, 0x09, 0x01,
+		0x07, 0x00, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x0b,
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	err = watch(t, func() error {
+		in, err := m.Start(ctx)
+		if err == nil {
+			_ = in.Close(ctx)
+		}
+		return err
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want the Run deadline, got %v", err)
 	}
 }
 
