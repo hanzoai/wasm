@@ -69,7 +69,9 @@ guest that wants results exports `alloc(i32) i32`; one that does not gets
 The zero value is bounded, not unlimited: 256 pages (16 MiB) and a 5s ceiling on
 one call. An unset bound is the case most callers ship, so it is the one that has
 to be safe. A guest loop is not interruptible from outside except by cancelling
-its context, which is what `Run` does.
+its context, which is what `Run` does. A call stopped that way closes its
+instance, and the error matches `context.DeadlineExceeded` or
+`context.Canceled`.
 
 ## Naming
 

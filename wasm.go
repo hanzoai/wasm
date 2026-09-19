@@ -103,7 +103,13 @@ type Engine struct {
 // guest needs it to instantiate at all and nobody should have to learn that from
 // a panic. See Limits.NoWASI.
 func New(ctx context.Context, l Limits) (*Engine, error) {
-	cfg := wazero.NewRuntimeConfig().WithMemoryLimitPages(l.pages())
+	// CloseOnContextDone is what lets a context reach a running guest: wazero
+	// then checks it at the head of every loop, in Go, where the scheduler can
+	// also stop the goroutine for a garbage collection. Without it the guest is
+	// native code that neither a context nor the collector can interrupt, and a
+	// collection that waits on a guest that never returns stops every
+	// goroutine in the process.
+	cfg := wazero.NewRuntimeConfig().WithMemoryLimitPages(l.pages()).WithCloseOnContextDone(true)
 	rt := wazero.NewRuntimeWithConfig(ctx, cfg)
 	if !l.NoWASI {
 		if _, err := wasi_snapshot_preview1.Instantiate(ctx, rt); err != nil {
@@ -174,6 +180,11 @@ func (i *Instance) Memory() api.Memory { return i.mod.Memory() }
 // The deadline is applied HERE rather than at Start because it bounds a call,
 // not a sandbox: an instance may sit idle for as long as its caller likes, and
 // only a running guest can hang.
+//
+// A call its context ends, by Run or by the caller, is stopped where it stands
+// and closes the instance, which cannot pick up what the guest left half done.
+// The error matches context.DeadlineExceeded or context.Canceled with
+// errors.Is, and every later call on the instance answers that it is closed.
 func (i *Instance) Call(ctx context.Context, name string, args ...uint64) ([]uint64, error) {
 	fn := i.mod.ExportedFunction(name)
 	if fn == nil {

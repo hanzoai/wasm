@@ -3,6 +3,7 @@ package wasm_test
 import (
 	"context"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -132,6 +133,72 @@ func TestZeroLimitsAreBounded(t *testing.T) {
 	defer in.Close(ctx)
 	if _, err := in.Call(ctx, "add", 1, 2); err != nil {
 		t.Fatalf("a defaulted engine must still run: %v", err)
+	}
+}
+
+// spin.wasm: (func (export "spin") (loop (br 0))), a guest that never returns.
+var spinWasm = []byte{
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60,
+	0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x08, 0x01, 0x04, 0x73, 0x70,
+	0x69, 0x6e, 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x03, 0x40, 0x0c,
+	0x00, 0x0b, 0x0b,
+}
+
+// A guest that never returns is stopped by Run, or sooner by the caller's own
+// context, and the call answers with that context's error. While it runs it
+// yields to Go, so a garbage collection started meanwhile finishes. A guest
+// that did not yield would keep the collection waiting forever, and every
+// other goroutine in the process with it.
+func TestRunStopsAGuestThatNeverReturns(t *testing.T) {
+	ctx := context.Background()
+	e, err := wasm.New(ctx, wasm.Limits{Run: time.Second})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer e.Close(ctx)
+	m, err := e.Compile(ctx, spinWasm)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	spin := func(ctx context.Context) <-chan error {
+		in, err := m.Start(context.Background())
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			defer in.Close(context.Background())
+			_, err := in.Call(ctx, "spin")
+			done <- err
+		}()
+		return done
+	}
+	answer := func(done <-chan error) error {
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(10 * time.Second):
+			t.Fatal("the guest is still running 10s later")
+			return nil
+		}
+	}
+
+	done := spin(ctx)
+	time.Sleep(100 * time.Millisecond)
+	runtime.GC()
+	select {
+	case err := <-done:
+		t.Errorf("the guest stopped before a collection could finish: %v", err)
+	default:
+	}
+	if err := answer(done); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a spent Run answered %v", err)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := answer(spin(cancelled)); !errors.Is(err, context.Canceled) {
+		t.Errorf("a cancelled context answered %v", err)
 	}
 }
 
