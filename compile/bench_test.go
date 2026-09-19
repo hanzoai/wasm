@@ -21,7 +21,7 @@ func benchBlob(b *testing.B, env, sumEnv string) Blob {
 	b.Helper()
 	path := os.Getenv(env)
 	if path == "" {
-		b.Skipf("%s is unset: no module to run", env)
+		b.Fatalf("%s is unset: point it at the wasm module. There is no number to report without it", env)
 	}
 	sum := os.Getenv(sumEnv)
 	if sum == "" {
@@ -35,13 +35,16 @@ func benchBlob(b *testing.B, env, sumEnv string) Blob {
 	return Blob{Path: path, Sum: sum}
 }
 
-func benchCache(b *testing.B) string {
+// warm fills the compilation cache so a benchmark measures reading machine code
+// back rather than producing it once. The ~12s compile is a different number,
+// and one of them in a mean hides the other.
+func warm(b *testing.B, blob Blob) {
 	b.Helper()
-	dir := os.TempDir() + "/hanzo-compile-cache"
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		b.Fatalf("cache dir: %v", err)
+	e, err := newEngine(context.Background(), Config{Blob: blob, Cache: cacheDir})
+	if err != nil {
+		b.Fatal(err)
 	}
-	return dir
+	e.Close(context.Background())
 }
 
 // Cold is a host starting up: read 49 MiB of machine code back out of the
@@ -49,9 +52,10 @@ func benchCache(b *testing.B) string {
 // instead, which is the whole reason Config.Cache exists.
 func BenchmarkTSGoCold(b *testing.B) {
 	ctx := context.Background()
-	blob, cache := benchBlob(b, envTSGo, envTSGoSum), benchCache(b)
+	blob := benchBlob(b, envTSGo, envTSGoSum)
+	warm(b, blob)
 	for b.Loop() {
-		c, err := NewTSGo(ctx, Config{Blob: blob, Cache: cache})
+		c, err := NewTSGo(ctx, Config{Blob: blob, Cache: cacheDir})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -66,7 +70,7 @@ func BenchmarkTSGoCold(b *testing.B) {
 // check, the module already compiled.
 func BenchmarkTSGoWarm(b *testing.B) {
 	ctx := context.Background()
-	c, err := NewTSGo(ctx, Config{Blob: benchBlob(b, envTSGo, envTSGoSum), Cache: benchCache(b)})
+	c, err := NewTSGo(ctx, Config{Blob: benchBlob(b, envTSGo, envTSGoSum), Cache: cacheDir})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -74,7 +78,6 @@ func BenchmarkTSGoWarm(b *testing.B) {
 	if _, err := c.Check(ctx, project(), Options{}); err != nil {
 		b.Fatal(err)
 	}
-	b.ResetTimer()
 	for b.Loop() {
 		if _, err := c.Check(ctx, project(), Options{}); err != nil {
 			b.Fatal(err)
@@ -88,7 +91,7 @@ func BenchmarkTSGoWarm(b *testing.B) {
 func BenchmarkTSGoFleet(b *testing.B) {
 	const n = 8
 	ctx := context.Background()
-	c, err := NewTSGo(ctx, Config{Blob: benchBlob(b, envTSGo, envTSGoSum), Cache: benchCache(b)})
+	c, err := NewTSGo(ctx, Config{Blob: benchBlob(b, envTSGo, envTSGoSum), Cache: cacheDir})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -96,7 +99,6 @@ func BenchmarkTSGoFleet(b *testing.B) {
 	if _, err := c.Check(ctx, project(), Options{}); err != nil {
 		b.Fatal(err)
 	}
-	b.ResetTimer()
 	for b.Loop() {
 		var wg sync.WaitGroup
 		errs := make([]error, n)
@@ -125,9 +127,10 @@ func BenchmarkTSGoFleet(b *testing.B) {
 // incremental number belongs to a kept session and is not what this measures.
 func BenchmarkEsbuildCold(b *testing.B) {
 	ctx := context.Background()
-	blob, cache := benchBlob(b, envEsbuild, envEsbSum), benchCache(b)
+	blob := benchBlob(b, envEsbuild, envEsbSum)
+	warm(b, blob)
 	for b.Loop() {
-		e, err := NewEsbuild(ctx, Config{Blob: blob, Cache: cache})
+		e, err := NewEsbuild(ctx, Config{Blob: blob, Cache: cacheDir})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -140,7 +143,7 @@ func BenchmarkEsbuildCold(b *testing.B) {
 
 func BenchmarkEsbuildWarm(b *testing.B) {
 	ctx := context.Background()
-	e, err := NewEsbuild(ctx, Config{Blob: benchBlob(b, envEsbuild, envEsbSum), Cache: benchCache(b)})
+	e, err := NewEsbuild(ctx, Config{Blob: benchBlob(b, envEsbuild, envEsbSum), Cache: cacheDir})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -148,7 +151,6 @@ func BenchmarkEsbuildWarm(b *testing.B) {
 	if _, err := e.Bundle(ctx, three(), BundleOptions{}); err != nil {
 		b.Fatal(err)
 	}
-	b.ResetTimer()
 	for b.Loop() {
 		if _, err := e.Bundle(ctx, three(), BundleOptions{}); err != nil {
 			b.Fatal(err)
@@ -159,7 +161,7 @@ func BenchmarkEsbuildWarm(b *testing.B) {
 func BenchmarkEsbuildFleet(b *testing.B) {
 	const n = 8
 	ctx := context.Background()
-	e, err := NewEsbuild(ctx, Config{Blob: benchBlob(b, envEsbuild, envEsbSum), Cache: benchCache(b)})
+	e, err := NewEsbuild(ctx, Config{Blob: benchBlob(b, envEsbuild, envEsbSum), Cache: cacheDir})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -167,7 +169,6 @@ func BenchmarkEsbuildFleet(b *testing.B) {
 	if _, err := e.Bundle(ctx, three(), BundleOptions{}); err != nil {
 		b.Fatal(err)
 	}
-	b.ResetTimer()
 	for b.Loop() {
 		var wg sync.WaitGroup
 		errs := make([]error, n)

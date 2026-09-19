@@ -27,7 +27,11 @@ package compile
 import (
 	"context"
 	"fmt"
+	"io/fs"
+	"path"
+	"reflect"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -39,6 +43,11 @@ import (
 // s3 and the host answers reads from its own cache, so a checker cannot reach
 // anything the host did not hand it, and the same project serves a laptop, a
 // test and a fleet without changing shape.
+//
+// An implementation may take a name literally. Nothing reaching these methods
+// climbs out of the project: rel cleans every guest string and refuses one that
+// leaves the root, so a host is free to be the obvious thing — a map, or
+// os.ReadFile under a base directory — without repeating that check.
 type Files interface {
 	// ReadFile returns one file's bytes, or an error naming what was missing.
 	ReadFile(name string) ([]byte, error)
@@ -74,13 +83,69 @@ func (p Project) root() string {
 	return p.Root
 }
 
+// names is the project's entries as names the host answers for. An entry is the
+// one name a caller supplies rather than a guest, and it gets the same treatment
+// for the same reason: Entry{"../../../../etc/passwd.ts"} is a request to read
+// something the project does not contain.
+func (p Project) names() ([]string, error) {
+	out := make([]string, 0, len(p.Entry))
+	for _, e := range p.Entry {
+		name, err := rel(e, p.root())
+		if err != nil {
+			return nil, fmt.Errorf("compile: entry %q is not a name in the project", e)
+		}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+// rel turns a name a guest printed into the project-relative name the host
+// answers for, or refuses it. tsc prints relative to the tsconfig's directory,
+// which is the root, and esbuild prints the absolute name the host resolver
+// returned — and a guest whose working directory is / prints the root itself as
+// a leading segment. Clean the name first, which is what makes a ".." a
+// traversal instead of a segment, trim the root in whichever of the three forms
+// it arrives in, and refuse what is left if it does not stay inside the project.
+//
+// Every string that becomes a call on Files comes through here: a guest's
+// import, a caller's entry, a host's own Realpath answer. Trimming a prefix
+// without cleaning turned "/project/../outside" into "../outside", which is a
+// name a host serving files off a disk answers for.
+func rel(name, root string) (string, error) {
+	clean := path.Clean(name)
+	root = strings.TrimSuffix(root, "/")
+	for _, prefix := range []string{root + "/", strings.TrimPrefix(root, "/") + "/"} {
+		if prefix == "/" {
+			continue // a root of "" or "/" has nothing to trim
+		}
+		if trimmed := strings.TrimPrefix(clean, prefix); trimmed != clean {
+			clean = trimmed
+			break
+		}
+	}
+	// fs.ValidPath is the same predicate the guest's own mount is held to:
+	// unrooted, no "." or ".." element, nothing trailing.
+	if clean == "." || !fs.ValidPath(clean) {
+		return "", fmt.Errorf("compile: %q is not a name in the project", name)
+	}
+	return clean, nil
+}
+
 // Diagnostic is what every checker answers in. One shape, or the
 // generalization is fake: an agent that can read a tsgo error reads a clippy
 // error with no new code.
+//
+// File is project-relative, and empty for a diagnostic about no file — a bad
+// flag, a missing type package. Line and Column are 1-based and 0 when the
+// diagnostic has no position in a file, which is the only meaning 0 carries: a
+// checker that knows the file but not the line still names the file.
+//
+// Column counts UTF-16 code units, which is what every compiler in the set
+// reports. esbuild counts bytes; that translation happens once, here.
 type Diagnostic struct {
 	File     string `json:"file"`
-	Line     int    `json:"line"`     // 1-based
-	Column   int    `json:"column"`   // 1-based
+	Line     int    `json:"line"`     // 1-based, 0 when there is no position
+	Column   int    `json:"column"`   // 1-based, 0 when there is no position
 	Severity string `json:"severity"` // error | warning | info
 	Code     string `json:"code"`     // "TS2322", "E0308", "no-unused-vars"
 	Message  string `json:"message"`
@@ -173,8 +238,18 @@ var registry struct {
 
 // Register files v under its own name, as a checker if it checks, as a bundler
 // if it bundles, as both if it does both. A value that does neither is refused,
-// and so is a second value claiming a name already taken.
+// and so is a second value claiming a name already taken, and so is a nil: a
+// constructor that failed hands one back, and filing it would turn that error
+// into a nil dereference at the first request.
 func Register(v any) error {
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Invalid:
+		return fmt.Errorf("compile: cannot register nil")
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func:
+		if rv.IsNil() {
+			return fmt.Errorf("compile: cannot register a nil %T", v)
+		}
+	}
 	c, isChecker := v.(Checker)
 	b, isBundler := v.(Bundler)
 	if !isChecker && !isBundler {

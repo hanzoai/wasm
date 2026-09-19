@@ -150,6 +150,14 @@ the host answers reads out of its own cache, and the guest reaches exactly what
 the host answers for and nothing else. `Map` is the in-memory implementation a
 test uses and the shape a warm cache takes.
 
+Every string that becomes one of those calls is cleaned first and refused if it
+leaves the root — a guest's import, a caller's entry, the host's own `Realpath`
+answer. `import "/project/../outside"` is not a file: it is a name the project
+does not contain, and the guest is told so at the line that asked for it. A path
+in an esbuild `on-load` request is no different — only a name some `on-resolve`
+already answered for is read, because a field in a request is not authority. So
+the obvious host, `os.ReadFile(filepath.Join(base, name))`, is a safe one.
+
 esbuild needs no filesystem at all: its plugin protocol carries every resolve
 and load, so the module runs with **zero preopened directories**. tsgo issues
 ordinary WASI reads — porting a compiler off a filesystem would mean forking it
@@ -160,9 +168,16 @@ exists only in the guest's view of the tree.
 ### One diagnostic shape
 
 `{file, line, column, severity, code, message, checker}`, lines and columns
-1-based because every compiler in the set already reports that way. esbuild's
-column counts bytes from 0; that translation happens here, once, rather than in
-every caller. An agent that reads a `TS2322` reads an `E0308` with no new code.
+1-based because every compiler in the set already reports that way. A column
+counts UTF-16 code units, which is what a compiler counts; esbuild counts bytes
+from 0, so on `import { nope as ééé } from "./gone";` it puts the opening quote
+at 32 where tsgo puts it at 29. Both say 29 here, and that translation happens
+once rather than in every caller.
+
+A diagnostic about no position in a file has line and column 0 — the only thing 0
+means — and still names its file when the message does: tsc reports `File
+'/project/ghost.ts' not found.` with no location at all, and an agent routes by
+file. An agent that reads a `TS2322` reads an `E0308` with no new code.
 
 ### What it costs
 
@@ -192,5 +207,6 @@ answers per-edit checks — not more instances.
 tsgo is 49 MB and esbuild 20 MB. `Blob` names one by path or URL **and** its
 sha256; a blob with no digest is refused rather than trusted. The tests want
 `TSGO_WASM` and `ESBUILD_WASM` pointing at local builds, with `TSGO_SHA256` and
-`ESBUILD_SHA256` to pin them; without those they skip and say which one is
-missing.
+`ESBUILD_SHA256` to pin them. Without those they **fail** and name the one that
+is missing. They do not skip: a run of this package that ran neither compiler has
+verified nothing, and a skip prints `ok` for it.

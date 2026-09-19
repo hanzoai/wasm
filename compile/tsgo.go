@@ -58,7 +58,11 @@ func (t *TSGo) Detects(p Project) bool {
 	if p.Files.FileExists(tsconfigName) {
 		return true
 	}
-	for _, e := range p.Entry {
+	names, err := p.names()
+	if err != nil {
+		return false
+	}
+	for _, e := range names {
 		if tsExt[path.Ext(e)] {
 			return true
 		}
@@ -82,16 +86,20 @@ func (t *TSGo) Check(ctx context.Context, p Project, o Options) ([]Diagnostic, e
 		return nil, err
 	}
 	root := strings.TrimSuffix(p.root(), "/")
+	entry, err := p.names()
+	if err != nil {
+		return nil, err
+	}
 
 	tree := &tree{files: p.Files}
 	if !p.Files.FileExists(tsconfigName) {
 		// With neither a config nor an entry there is nothing to name in a
 		// synthesized one, and tsc's answer — "no inputs were found" — would
 		// arrive as a diagnostic about source that does not exist.
-		if names, err := p.Files.Entries("."); len(p.Entry) == 0 && (err != nil || len(names) == 0) {
+		if names, err := p.Files.Entries("."); len(entry) == 0 && (err != nil || len(names) == 0) {
 			return nil, fmt.Errorf("compile: tsgo: project has no %s and no files", tsconfigName)
 		}
-		cfg, err := synthesize(p, o)
+		cfg, err := synthesize(entry, o)
 		if err != nil {
 			return nil, err
 		}
@@ -106,11 +114,12 @@ func (t *TSGo) Check(ctx context.Context, p Project, o Options) ([]Diagnostic, e
 		args = append(args, "--types", strings.Join(o.Types, ","))
 	}
 
-	var out, errb bytes.Buffer
+	var out bytes.Buffer
+	var errs sink
 	cfg := wazero.NewModuleConfig().
 		WithName(t.e.name("tsgo")).
 		WithArgs(args...).
-		WithStdout(&out).WithStderr(&errb).
+		WithStdout(&out).WithStderr(&errs).
 		WithEnv("GOMEMLIMIT", limit).
 		WithFSConfig(wazero.NewFSConfig().WithFSMount(tree, root)).
 		WithSysWalltime().WithSysNanotime().WithSysNanosleep()
@@ -135,7 +144,7 @@ func (t *TSGo) Check(ctx context.Context, p Project, o Options) ([]Diagnostic, e
 
 	diags := parseTSC(out.String(), root)
 	if len(diags) == 0 && code != 0 {
-		return nil, fmt.Errorf("compile: tsgo exited %d: %s", code, tail(out.String(), errb.String()))
+		return nil, fmt.Errorf("compile: tsgo exited %d: %s", code, tail(out.String(), errs.text()))
 	}
 	return diags, nil
 }
@@ -143,7 +152,7 @@ func (t *TSGo) Check(ctx context.Context, p Project, o Options) ([]Diagnostic, e
 // synthesize writes the tsconfig a project without one would have written. It
 // exists in the guest's view of the project and nowhere else — no file is
 // created on any disk, and the project the caller handed us is unchanged.
-func synthesize(p Project, o Options) ([]byte, error) {
+func synthesize(entry []string, o Options) ([]byte, error) {
 	lib := o.Lib
 	if len(lib) == 0 {
 		lib = []string{"es2022"}
@@ -162,8 +171,8 @@ func synthesize(p Project, o Options) ([]byte, error) {
 		"types":            types,
 	}
 	cfg := map[string]any{"compilerOptions": opts}
-	if len(p.Entry) > 0 {
-		cfg["files"] = p.Entry
+	if len(entry) > 0 {
+		cfg["files"] = entry
 	} else {
 		cfg["include"] = []string{"**/*"}
 	}
@@ -180,6 +189,7 @@ func synthesize(p Project, o Options) ([]byte, error) {
 var (
 	located = regexp.MustCompile(`^(\S.*)\((\d+),(\d+)\): (error|warning|message) ([^:]+): (.*)$`)
 	bare    = regexp.MustCompile(`^(error|warning|message) ([^:]+): (.*)$`)
+	quoted  = regexp.MustCompile(`'([^']*)'`)
 )
 
 func parseTSC(out, root string) []Diagnostic {
@@ -192,8 +202,12 @@ func parseTSC(out, root string) []Diagnostic {
 		if m := located.FindStringSubmatch(line); m != nil {
 			l, _ := strconv.Atoi(m[2])
 			c, _ := strconv.Atoi(m[3])
+			// A name with no project-relative form gets none: inventing one
+			// would point an agent's edit at a file that is not the one the
+			// compiler meant.
+			file, _ := rel(m[1], root)
 			diags = append(diags, Diagnostic{
-				File:     rel(m[1], root),
+				File:     file,
 				Line:     l,
 				Column:   c,
 				Severity: severity(m[4]),
@@ -205,6 +219,7 @@ func parseTSC(out, root string) []Diagnostic {
 		}
 		if m := bare.FindStringSubmatch(line); m != nil {
 			diags = append(diags, Diagnostic{
+				File:     named(m[3], root),
 				Severity: severity(m[1]),
 				Code:     m[2],
 				Message:  m[3],
@@ -219,6 +234,24 @@ func parseTSC(out, root string) []Diagnostic {
 	return diags
 }
 
+// named is the file a diagnostic with no position names in its own text. tsc
+// reports "File '/project/ghost.ts' not found." with no location at all, and an
+// agent that cannot see which file a diagnostic is about cannot route it. The
+// quoted value has to look like source — loaders is the set of extensions this
+// package reads — because plenty of messages quote a flag or a package instead.
+func named(message, root string) string {
+	for _, m := range quoted.FindAllStringSubmatch(message, -1) {
+		name, err := rel(m[1], root)
+		if err != nil {
+			continue
+		}
+		if _, ok := loaders[path.Ext(name)]; ok {
+			return name
+		}
+	}
+	return ""
+}
+
 func severity(s string) string {
 	switch s {
 	case "error":
@@ -228,26 +261,6 @@ func severity(s string) string {
 	default:
 		return Info
 	}
-}
-
-// rel turns a name a guest printed into a project-relative one. tsc prints
-// relative to the tsconfig's directory, which is the root, and esbuild prints
-// the absolute name the host resolver returned — and a guest whose working
-// directory is / prints the root itself as a leading segment. Trim the root in
-// whichever of the three forms it arrives in, and leave a name outside the
-// project alone.
-func rel(name, root string) string {
-	name = strings.TrimPrefix(name, "./")
-	root = strings.TrimSuffix(root, "/")
-	for _, prefix := range []string{root + "/", strings.TrimPrefix(root, "/") + "/"} {
-		if prefix == "/" {
-			continue // a root of "" or "/" has nothing to trim
-		}
-		if trimmed := strings.TrimPrefix(name, prefix); trimmed != name {
-			return trimmed
-		}
-	}
-	return strings.TrimPrefix(name, "/")
 }
 
 func tail(out, err string) string {

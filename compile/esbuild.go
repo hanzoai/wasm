@@ -9,7 +9,6 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/sys"
@@ -20,10 +19,10 @@ import (
 // would disagree about flags rather than fail.
 const esbuildVersion = "0.28.2"
 
-// hostspace is the namespace every file the host serves lives in. esbuild
-// prefixes a diagnostic's file with it, so it is also what has to come off
-// again on the way out.
-const hostspace = "hostfs"
+// space is the namespace every file the host serves lives in, and the name of
+// the plugin that answers for it. esbuild prefixes a diagnostic's file with it,
+// so it is also what has to come off again on the way out.
+const space = "project"
 
 // Esbuild bundles. The module is upstream esbuild built for wasip1, driven over
 // its stdio service protocol with a plugin standing in for the filesystem, so
@@ -68,7 +67,11 @@ func (b *Esbuild) Detects(p Project) bool {
 	if p.Files == nil {
 		return false
 	}
-	for _, e := range p.Entry {
+	names, err := p.names()
+	if err != nil {
+		return false
+	}
+	for _, e := range names {
 		if _, ok := loaders[path.Ext(e)]; ok && p.Files.FileExists(e) {
 			return true
 		}
@@ -88,7 +91,11 @@ func (b *Esbuild) Bundle(ctx context.Context, p Project, o BundleOptions) (Artif
 		return Artifact{}, fmt.Errorf("compile: esbuild: project names no entry")
 	}
 	root := strings.TrimSuffix(p.root(), "/")
-	for _, e := range p.Entry {
+	entry, err := p.names()
+	if err != nil {
+		return Artifact{}, err
+	}
+	for _, e := range entry {
 		if _, ok := loaders[path.Ext(e)]; !ok {
 			return Artifact{}, fmt.Errorf("compile: esbuild: no loader for %q", path.Ext(e))
 		}
@@ -114,10 +121,11 @@ func (b *Esbuild) Bundle(ctx context.Context, p Project, o BundleOptions) (Artif
 		hostR.Close()
 	}()
 
+	var errs sink
 	cfg := wazero.NewModuleConfig().
 		WithName(b.e.name("esbuild")).
 		WithArgs("esbuild", "--service="+esbuildVersion).
-		WithStdin(guestIn).WithStdout(guestOut).WithStderr(os.Stderr).
+		WithStdin(guestIn).WithStdout(guestOut).WithStderr(&errs).
 		WithSysWalltime().WithSysNanotime().WithSysNanosleep()
 
 	done := make(chan error, 1)
@@ -137,40 +145,51 @@ func (b *Esbuild) Bundle(ctx context.Context, p Project, o BundleOptions) (Artif
 		done <- err
 	}()
 
-	host := &hostfs{files: p.Files, root: root}
+	host := &plugin{files: p.Files, root: root}
 	s := newService(hostW, hostR)
 	s.answer = host.answer
 	if err := s.handshake(); err != nil {
-		return Artifact{}, err
+		// A cancelled context closes the instance, which ends the stream, which
+		// reads as a truncated header. Report what actually happened.
+		if ctx.Err() != nil {
+			return Artifact{}, ctx.Err()
+		}
+		return Artifact{}, errs.wrap(err)
 	}
 	if s.version != esbuildVersion {
 		return Artifact{}, fmt.Errorf("compile: esbuild module is %s, host speaks %s", s.version, esbuildVersion)
 	}
 	go s.serve()
 
-	resp, err := s.send(buildRequest(root, p.Entry, o))
+	resp, err := s.send(buildRequest(root, entry, o))
 	if err != nil {
-		return Artifact{}, err
+		if ctx.Err() != nil {
+			return Artifact{}, ctx.Err()
+		}
+		return Artifact{}, errs.wrap(err)
 	}
 	if msg, ok := resp["error"].(string); ok && msg != "" {
 		return Artifact{}, fmt.Errorf("compile: esbuild refused the build: %s", msg)
 	}
 
-	art := artifact(resp, root)
+	art, err := artifact(resp, root)
+	if err != nil {
+		return Artifact{}, err
+	}
 	if err := host.failed(); err != nil {
 		return art, err
 	}
 
-	// Closing the write end is how the service is told to exit; a module that
-	// then hangs is a defect worth naming rather than a goroutine to leak.
+	// Closing the write end is how the service is told to exit. The wait is
+	// bounded by the caller's context and nothing else: wazero closes the
+	// instance when that context is done, which is the same bound the check path
+	// runs under, and a constant here turns a slow box into a failed bundle.
 	hostW.Close()
 	select {
 	case err := <-done:
 		if err != nil {
-			return art, fmt.Errorf("compile: esbuild: %w", err)
+			return art, errs.wrap(fmt.Errorf("compile: esbuild: %w", err))
 		}
-	case <-time.After(5 * time.Second):
-		return art, fmt.Errorf("compile: esbuild did not exit after its stdin closed")
 	case <-ctx.Done():
 		return art, ctx.Err()
 	}
@@ -212,28 +231,32 @@ func buildRequest(root string, entry []string, o BundleOptions) map[string]any {
 		"absWorkingDir": root,
 		"nodePaths":     []any{},
 		"plugins": []any{map[string]any{
-			"name":      hostspace,
+			"name":      space,
 			"onEnd":     false,
 			"onResolve": []any{map[string]any{"id": 1, "filter": ".*", "namespace": ""}},
-			"onLoad":    []any{map[string]any{"id": 2, "filter": ".*", "namespace": hostspace}},
+			"onLoad":    []any{map[string]any{"id": 2, "filter": ".*", "namespace": space}},
 		}},
 	}
 }
 
-// hostfs answers the guest's resolve and load requests out of the project. This
-// is the filesystem, and it is a function call.
+// plugin is the host half of esbuild's plugin protocol: it answers the guest's
+// resolve and load requests out of the project. This is the filesystem, and it
+// is a function call.
 //
-// Answers run on the goroutine reading the guest's stream while the caller
-// waits on the build, so the one field that crosses between them is guarded.
-type hostfs struct {
+// Answers run on the goroutine reading the guest's stream while the caller waits
+// on the build, so what crosses between them is guarded. served is why a load is
+// not the guest's decision: a path arrives in a request field, and a request
+// field is not authority — only a name some resolve already answered for is.
+type plugin struct {
 	files Files
 	root  string
 
 	mu     sync.Mutex
 	broken error
+	served map[string]string // project-relative name, by the path a resolve answered with
 }
 
-func (h *hostfs) fail(err error) {
+func (h *plugin) fail(err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.broken == nil {
@@ -241,16 +264,32 @@ func (h *hostfs) fail(err error) {
 	}
 }
 
-func (h *hostfs) failed() error {
+func (h *plugin) failed() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.broken
 }
 
+func (h *plugin) keep(full, name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.served == nil {
+		h.served = map[string]string{}
+	}
+	h.served[full] = name
+}
+
+func (h *plugin) kept(full string) (string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	name, ok := h.served[full]
+	return name, ok
+}
+
 // extensions are tried in the order TypeScript's own resolver tries them.
 var extensions = []string{"", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json", ".css"}
 
-func (h *hostfs) answer(req map[string]any) map[string]any {
+func (h *plugin) answer(req map[string]any) map[string]any {
 	switch req["command"] {
 	case "on-start":
 		// Both keys are required: esbuild asserts them without checking, so an
@@ -264,10 +303,18 @@ func (h *hostfs) answer(req map[string]any) map[string]any {
 		if !ok {
 			return map[string]any{"error": fmt.Sprintf("host serves no %q imported from %q", p, importer)}
 		}
-		return map[string]any{"id": 1, "path": full, "namespace": hostspace}
+		return map[string]any{"id": 1, "path": full, "namespace": space}
 	case "on-load":
 		full, _ := req["path"].(string)
-		name := rel(full, h.root)
+		name, ok := h.kept(full)
+		if !ok {
+			// The guest is asking for a file by a name no resolve of ours
+			// produced. Reading it would make the request field the authority
+			// on what the project contains.
+			err := fmt.Errorf("compile: esbuild asked to load %q, which no resolve answered for", full)
+			h.fail(err)
+			return map[string]any{"error": err.Error()}
+		}
 		loader, ok := loaders[path.Ext(name)]
 		if !ok {
 			return map[string]any{"error": fmt.Sprintf("host has no loader for %q", path.Ext(name))}
@@ -292,7 +339,7 @@ func (h *hostfs) answer(req map[string]any) map[string]any {
 
 // resolve turns an import into a name the project answers for, or reports that
 // nothing does. It never guesses: every candidate is checked against the host.
-func (h *hostfs) resolve(p, importer, resolveDir string) (string, bool) {
+func (h *plugin) resolve(p, importer, resolveDir string) (string, bool) {
 	base := resolveDir
 	if importer != "" {
 		base = path.Dir(importer)
@@ -300,9 +347,10 @@ func (h *hostfs) resolve(p, importer, resolveDir string) (string, bool) {
 	if base == "" {
 		base = h.root
 	}
-	candidate := p
+	var candidate string
 	switch {
 	case strings.HasPrefix(p, "/"):
+		candidate = path.Clean(p)
 	case strings.HasPrefix(p, "."):
 		candidate = path.Join(base, p)
 	default:
@@ -322,20 +370,33 @@ func (h *hostfs) resolve(p, importer, resolveDir string) (string, bool) {
 }
 
 // serves reports whether the project answers for a candidate, under the name
-// the host itself uses. Two imports that reach one file through different names
-// resolve to the same module, so the bundler includes it once.
-func (h *hostfs) serves(candidate string) (string, bool) {
-	name := rel(candidate, h.root)
+// the host itself uses, and remembers that name for the load that follows. Two
+// imports that reach one file through different names resolve to the same
+// module, so the bundler includes it once.
+func (h *plugin) serves(candidate string) (string, bool) {
+	name, err := rel(candidate, h.root)
+	if err != nil {
+		return "", false
+	}
 	if !h.files.FileExists(name) {
 		return "", false
 	}
 	if real, err := h.files.Realpath(name); err == nil {
-		name = real
+		canonical, err := rel(real, h.root)
+		if err != nil {
+			// The host is trusted for bytes, not for staying inside its own
+			// project. Reading the name it replaced would hide the defect.
+			h.fail(fmt.Errorf("compile: the host resolves %q to %q, which is not in the project", name, real))
+			return "", false
+		}
+		name = canonical
 	}
-	return h.root + "/" + name, true
+	full := h.root + "/" + name
+	h.keep(full, name)
+	return full, true
 }
 
-func artifact(resp map[string]any, root string) Artifact {
+func artifact(resp map[string]any, root string) (Artifact, error) {
 	var art Artifact
 	for _, f := range list(resp["outputFiles"]) {
 		f, ok := f.(map[string]any)
@@ -343,12 +404,16 @@ func artifact(resp map[string]any, root string) Artifact {
 			continue
 		}
 		p, _ := f["path"].(string)
+		name, err := rel(p, root)
+		if err != nil {
+			return Artifact{}, fmt.Errorf("compile: esbuild wrote %q, which is not in the project", p)
+		}
 		bytes, _ := f["contents"].([]byte)
-		art.Files = append(art.Files, File{Path: rel(p, root), Bytes: bytes})
+		art.Files = append(art.Files, File{Path: name, Bytes: bytes})
 	}
 	art.Diagnostics = append(art.Diagnostics, messages(resp["errors"], Error, root)...)
 	art.Diagnostics = append(art.Diagnostics, messages(resp["warnings"], Warning, root)...)
-	return art
+	return art, nil
 }
 
 func list(v any) []any {
@@ -358,7 +423,7 @@ func list(v any) []any {
 
 // messages normalizes esbuild's shape. Its column is a 0-based byte offset into
 // the line, so it is the one number that has to be translated: everything a
-// caller sees from this package is 1-based.
+// caller sees from this package counts UTF-16 code units from 1.
 func messages(v any, severity, root string) []Diagnostic {
 	var out []Diagnostic
 	for _, m := range list(v) {
@@ -371,12 +436,14 @@ func messages(v any, severity, root string) []Diagnostic {
 		d.Code, _ = m["id"].(string)
 		if loc, ok := m["location"].(map[string]any); ok {
 			file, _ := loc["file"].(string)
-			file = strings.TrimPrefix(file, hostspace+":")
 			line, _ := loc["line"].(int)
 			column, _ := loc["column"].(int)
-			d.File = rel(file, root)
+			text, _ := loc["lineText"].(string)
+			if name, err := rel(strings.TrimPrefix(file, space+":"), root); err == nil {
+				d.File = name
+			}
 			d.Line = line
-			d.Column = column + 1
+			d.Column = units(text, column)
 		}
 		for _, n := range list(m["notes"]) {
 			if n, ok := n.(map[string]any); ok {
@@ -388,4 +455,29 @@ func messages(v any, severity, root string) []Diagnostic {
 		out = append(out, d)
 	}
 	return out
+}
+
+// units turns esbuild's column into the one every other checker reports. esbuild
+// counts bytes from 0 and a compiler counts UTF-16 code units from 1, so the
+// same position in a line holding a multi-byte rune is a different number in
+// each: on `import { nope as ééé } from "./gone";` the opening quote is 29 to
+// tsgo and 32 to esbuild, and a caller that has to know which one answered does
+// not have one diagnostic shape.
+func units(line string, offset int) int {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(line) {
+		// With no line there is nothing to count runes in, and esbuild's own
+		// number is already right for a line that is all ASCII.
+		return offset + 1
+	}
+	n := 1
+	for _, r := range line[:offset] {
+		n++
+		if r > 0xFFFF {
+			n++ // a rune outside the basic plane is a surrogate pair
+		}
+	}
+	return n
 }

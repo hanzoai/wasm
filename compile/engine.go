@@ -5,6 +5,8 @@ package compile
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/tetratelabs/wazero"
@@ -99,6 +101,45 @@ func (e *engine) gomemlimit(want uint32) (string, error) {
 		return "", fmt.Errorf("compile: %d MiB asked for, host cap is %d MiB", want, e.cap)
 	}
 	return fmt.Sprintf("%dMiB", want), nil
+}
+
+// sink collects what a guest writes to its stderr. The runtime writes it from
+// the goroutine running the instance while the host reads the build on another,
+// so it is guarded; and it keeps the tail rather than everything, because an
+// unbounded buffer is a guest's way to grow the host's heap. Handing the host
+// process's own stderr to a guest instead is neither of those things, and gives
+// a caller no way to see what was said.
+type sink struct {
+	mu sync.Mutex
+	b  []byte
+}
+
+// bound is how much of a guest's stderr survives. What matters is the end of it:
+// the panic, not the progress before it.
+const bound = 4 << 10
+
+func (s *sink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.b = append(s.b, p...)
+	if len(s.b) > bound {
+		s.b = s.b[len(s.b)-bound:]
+	}
+	return len(p), nil
+}
+
+func (s *sink) text() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return string(s.b)
+}
+
+// wrap adds what the guest said to a failure, when it said anything.
+func (s *sink) wrap(err error) error {
+	if said := strings.TrimSpace(s.text()); said != "" {
+		return fmt.Errorf("%w: %s", err, said)
+	}
+	return err
 }
 
 func (e *engine) Close(ctx context.Context) error {

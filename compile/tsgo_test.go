@@ -12,7 +12,7 @@ import (
 func tsgo(t *testing.T) *TSGo {
 	t.Helper()
 	ctx := context.Background()
-	c, err := NewTSGo(ctx, Config{Blob: blob(t, envTSGo, envTSGoSum), Cache: cache(t)})
+	c, err := NewTSGo(ctx, Config{Blob: blob(t, envTSGo, envTSGoSum), Cache: cacheDir})
 	if err != nil {
 		t.Fatalf("new tsgo: %v", err)
 	}
@@ -156,22 +156,46 @@ func TestParseTSC(t *testing.T) {
 	out := "project/src/a.ts(3,17): error TS2322: Type 'number' is not assignable to type 'string'.\n" +
 		"  The expected type comes from property 'x'.\n" +
 		"error TS5083: Cannot read file '/project/tsconfig.json'.\n" +
-		"src/b.ts(1,1): warning TS6133: 'x' is declared but never read.\n"
+		"src/b.ts(1,1): warning TS6133: 'x' is declared but never read.\n" +
+		"/etc/passwd.ts(1,1): error TS2322: Type 'number' is not assignable to type 'string'.\n"
 	diags := parseTSC(out, "/project")
-	if len(diags) != 3 {
+	if len(diags) != 4 {
 		t.Fatalf("got %d diagnostics: %+v", len(diags), diags)
 	}
 	if diags[0].File != "src/a.ts" || diags[0].Line != 3 || diags[0].Column != 17 || diags[0].Severity != Error {
-		t.Fatalf("located = %+v", diags[0])
+		t.Errorf("located = %+v", diags[0])
 	}
 	if !strings.HasSuffix(diags[0].Message, "property 'x'.") {
-		t.Fatalf("continuation line was dropped: %q", diags[0].Message)
+		t.Errorf("continuation line was dropped: %q", diags[0].Message)
 	}
-	if diags[1].Code != "TS5083" || diags[1].File != "" || diags[1].Line != 0 {
-		t.Fatalf("bare = %+v", diags[1])
+	// A diagnostic with no position still names its file when the message does,
+	// because an agent routes by file and 0 is not a line.
+	if diags[1].Code != "TS5083" || diags[1].File != "tsconfig.json" || diags[1].Line != 0 || diags[1].Column != 0 {
+		t.Errorf("bare = %+v", diags[1])
 	}
 	if diags[2].Severity != Warning || diags[2].File != "src/b.ts" {
-		t.Fatalf("warning = %+v", diags[2])
+		t.Errorf("warning = %+v", diags[2])
+	}
+	// A file the project does not serve gets no project-relative name rather
+	// than one that points an edit at the wrong file.
+	if diags[3].File != "" {
+		t.Errorf("a file outside the project was named %q", diags[3].File)
+	}
+}
+
+// Most quoted things in a tsc message are not files.
+func TestNamedOnlyLiftsAFile(t *testing.T) {
+	for _, c := range []struct{ message, want string }{
+		{"File '/project/ghost.ts' not found.", "ghost.ts"},
+		{"Cannot read file '/project/tsconfig.json'.", "tsconfig.json"},
+		{"Argument for '--lib' option must be: 'es5', 'es2022'.", ""},
+		{"Cannot find type definition file for 'node'.", ""},
+		{"File '/etc/passwd.ts' not found.", ""},
+		{"Cannot find module './gone' or its corresponding type declarations.", ""},
+	} {
+		if got := named(c.message, "/project"); got != c.want {
+			t.Errorf("named(%q) = %q, want %q", c.message, got, c.want)
+		}
 	}
 }
 

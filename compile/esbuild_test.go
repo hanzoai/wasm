@@ -11,7 +11,7 @@ import (
 func esbuild(t *testing.T) *Esbuild {
 	t.Helper()
 	ctx := context.Background()
-	b, err := NewEsbuild(ctx, Config{Blob: blob(t, envEsbuild, envEsbSum), Cache: cache(t)})
+	b, err := NewEsbuild(ctx, Config{Blob: blob(t, envEsbuild, envEsbSum), Cache: cacheDir})
 	if err != nil {
 		t.Fatalf("new esbuild: %v", err)
 	}
@@ -146,6 +146,100 @@ func TestEsbuildReportsAMissingImport(t *testing.T) {
 	}
 	if !strings.Contains(d.Message, "gone") {
 		t.Fatalf("message = %q", d.Message)
+	}
+}
+
+// One position, one number, whichever compiler answered. esbuild counts bytes
+// and tsgo counts UTF-16 code units, so a line with three two-byte runes in it
+// is where a package that promises one diagnostic shape either keeps that
+// promise or does not: the opening quote below is column 29 to tsgo and, before
+// the translation, 32 to esbuild.
+func TestColumnsAgreeAcrossCheckers(t *testing.T) {
+	const src = "import { nope as ééé } from \"./gone\";\nexport const x = ééé;\n"
+	const want = 29
+
+	diags, err := tsgo(t).Check(context.Background(), Project{
+		Root:  "/project",
+		Entry: []string{"entry.ts"},
+		Files: Map{"entry.ts": []byte(src)},
+	}, Options{})
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if len(diags) == 0 {
+		t.Fatal("tsgo reported nothing about a module that is not there")
+	}
+	if diags[0].Line != 1 || diags[0].Column != want {
+		t.Errorf("tsgo said %d:%d, want 1:%d", diags[0].Line, diags[0].Column, want)
+	}
+
+	art, err := esbuild(t).Bundle(context.Background(), Project{
+		Root:  "/project",
+		Entry: []string{"entry.ts"},
+		Files: Map{"entry.ts": []byte(src)},
+	}, BundleOptions{})
+	if err != nil {
+		t.Fatalf("bundle: %v", err)
+	}
+	if len(art.Diagnostics) == 0 {
+		t.Fatal("esbuild reported nothing about a module that is not there")
+	}
+	if got := art.Diagnostics[0]; got.Line != 1 || got.Column != want {
+		t.Errorf("esbuild said %d:%d, want 1:%d", got.Line, got.Column, want)
+	}
+}
+
+// Two names for one file are one module. The host says so through Realpath, and
+// nothing else can: only the host knows its own aliases.
+func TestEsbuildBundlesAnAliasedFileOnce(t *testing.T) {
+	b := esbuild(t)
+	files := &raw{
+		files: map[string][]byte{
+			"entry.ts": []byte("import { mark } from \"./lib\";\nimport { mark as same } from \"./alias\";\nexport const x = mark + same;\n"),
+			"lib.ts":   []byte("export const mark = 42;\n"),
+			"alias.ts": []byte("export const mark = 42;\n"),
+		},
+		alias: map[string]string{"alias.ts": "lib.ts"},
+	}
+	art, err := b.Bundle(context.Background(), Project{Root: "/project", Entry: []string{"entry.ts"}, Files: files}, BundleOptions{})
+	if err != nil {
+		t.Fatalf("bundle: %v", err)
+	}
+	if len(art.Diagnostics) != 0 {
+		t.Fatalf("diagnostics = %+v", art.Diagnostics)
+	}
+	f, ok := art.Find("entry.js")
+	if !ok {
+		t.Fatalf("no js output: %+v", art.Files)
+	}
+	if n := strings.Count(string(f.Bytes), "= 42"); n != 1 {
+		t.Fatalf("the aliased module is in the bundle %d times:\n%s", n, f.Bytes)
+	}
+}
+
+// A cancelled context ends the bundle as a cancellation, not as a truncated
+// handshake with the module that was closed under it.
+func TestEsbuildRespectsCancellation(t *testing.T) {
+	b := esbuild(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := b.Bundle(ctx, three(), BundleOptions{}); err != context.Canceled {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// The registry with the real value in it, not a nil standing in for one.
+func TestEsbuildRegistersOnlyAsABundler(t *testing.T) {
+	b := esbuild(t)
+	if err := Register(b); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	defer Unregister(b.Name())
+	if _, ok := BundlerNamed("esbuild"); !ok {
+		t.Error("esbuild is not registered as a bundler")
+	}
+	if c, ok := CheckerNamed("esbuild"); ok {
+		t.Errorf("esbuild is registered as a checker (%T): it does not typecheck", c)
 	}
 }
 

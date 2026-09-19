@@ -120,8 +120,13 @@ func (t *tree) read(name string) ([]byte, bool) {
 	}
 	// Ask the host what it calls this file before reading it: a host that
 	// serves an aliased tree answers reads under the canonical name, and a
-	// host with no aliases hands the same name back.
+	// host with no aliases hands the same name back. The answer is held to the
+	// same rule as the question — Open guards what the guest asked for, and an
+	// alias out of the project would walk straight past that guard.
 	if real, err := t.files.Realpath(name); err == nil {
+		if !fs.ValidPath(real) {
+			return nil, false
+		}
 		name = real
 	}
 	if !t.files.FileExists(name) {
@@ -153,6 +158,12 @@ func (t *tree) entries(name string) []string {
 	seen := map[string]bool{}
 	if list, err := t.files.Entries(name); err == nil {
 		for _, n := range list {
+			// A listing is bare names. One carrying a separator, or naming a
+			// parent, is not an entry of this directory and would be joined
+			// into a name that leaves it.
+			if n == "." || n == ".." || strings.ContainsRune(n, '/') {
+				continue
+			}
 			seen[n] = true
 		}
 	}

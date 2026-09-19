@@ -6,9 +6,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"testing/fstest"
 )
@@ -22,11 +25,32 @@ const (
 	envEsbSum  = "ESBUILD_SHA256"
 )
 
+// cacheDir holds compiled machine code for the length of one run, which is the
+// difference between a 12s compile and a 300ms read per constructor. It belongs
+// to that run alone: a fixed path would make an outcome depend on what another
+// run left behind, and two runs on one box would share it.
+var cacheDir string
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "compile-cache")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "compilation cache: %v\n", err)
+		os.Exit(1)
+	}
+	cacheDir = dir
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// blob names the module under test. Its absence is a failure and not a skip:
+// this package exists to run these two compilers, and a run that ran neither
+// has verified nothing while printing ok.
 func blob(t *testing.T, env, sumEnv string) Blob {
 	t.Helper()
 	path := os.Getenv(env)
 	if path == "" {
-		t.Skipf("%s is unset: no module to run", env)
+		t.Fatalf("%s is unset: point it at the wasm module. This package's tests are that module running, and skipping them prints ok for a run that verified nothing", env)
 	}
 	sum := os.Getenv(sumEnv)
 	if sum == "" {
@@ -39,17 +63,6 @@ func blob(t *testing.T, env, sumEnv string) Blob {
 		t.Logf("%s=%s (computed; set %s to pin)", env, sum, sumEnv)
 	}
 	return Blob{Path: path, Sum: sum}
-}
-
-// cache keeps compiled machine code between runs of the test binary, which is
-// the difference between 12s and 300ms per constructor.
-func cache(t *testing.T) string {
-	t.Helper()
-	dir := filepath.Join(os.TempDir(), "hanzo-compile-cache")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("cache dir: %v", err)
-	}
-	return dir
 }
 
 // project is two files and one deliberate type error.
@@ -71,9 +84,17 @@ func (f fake) Name() string                                                  { r
 func (f fake) Detects(Project) bool                                          { return true }
 func (f fake) Check(context.Context, Project, Options) ([]Diagnostic, error) { return nil, nil }
 
+type pack struct{}
+
+func (pack) Name() string         { return "pack" }
+func (pack) Detects(Project) bool { return true }
+func (pack) Bundle(context.Context, Project, BundleOptions) (Artifact, error) {
+	return Artifact{}, nil
+}
+
 func TestRegistry(t *testing.T) {
 	defer Unregister("fake")
-	defer Unregister("esbuild")
+	defer Unregister("pack")
 
 	if err := Register(fake{"fake"}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -85,25 +106,41 @@ func TestRegistry(t *testing.T) {
 		t.Fatal("registering a value that is neither was accepted")
 	}
 
-	// A nil *Esbuild is enough to register: Name does not touch the runtime,
-	// and this asserts the roles without compiling 20 MiB.
-	if err := Register((*Esbuild)(nil)); err != nil {
-		t.Fatalf("register esbuild: %v", err)
+	// A constructor that failed hands back a nil, and Name answers on one. A
+	// registry that accepts it turns that error into a nil dereference at the
+	// first request instead of a refusal here.
+	for _, v := range []any{nil, (*Esbuild)(nil), (*TSGo)(nil)} {
+		if err := Register(v); err == nil {
+			t.Errorf("registering a nil %T was accepted", v)
+			Unregister("esbuild")
+			Unregister("tsgo")
+		}
 	}
-	if _, ok := BundlerNamed("esbuild"); !ok {
-		t.Fatal("esbuild is not registered as a bundler")
-	}
-	if c, ok := CheckerNamed("esbuild"); ok {
-		t.Fatalf("esbuild is registered as a checker (%T): it does not typecheck", c)
-	}
+
+	// esbuild's roles are a fact about the type, so they need no runtime: it
+	// bundles `const wrong: string = add(1,2)` and exits 0, and the registry is
+	// what keeps it from claiming that source was checked.
 	if _, isChecker := any((*Esbuild)(nil)).(Checker); isChecker {
-		t.Fatal("*Esbuild satisfies Checker: it bundles a type error and exits 0")
+		t.Error("*Esbuild satisfies Checker: it bundles a type error and exits 0")
+	}
+	if _, isBundler := any((*Esbuild)(nil)).(Bundler); !isBundler {
+		t.Error("*Esbuild does not satisfy Bundler")
+	}
+
+	if err := Register(pack{}); err != nil {
+		t.Fatalf("register a bundler: %v", err)
+	}
+	if _, ok := BundlerNamed("pack"); !ok {
+		t.Error("a bundler is not registered as a bundler")
+	}
+	if c, ok := CheckerNamed("pack"); ok {
+		t.Errorf("a bundler is registered as a checker (%T)", c)
 	}
 	if _, ok := CheckerNamed("fake"); !ok {
-		t.Fatal("fake is not registered as a checker")
+		t.Error("a checker is not registered as a checker")
 	}
 	if _, ok := BundlerNamed("fake"); ok {
-		t.Fatal("fake is registered as a bundler")
+		t.Error("a checker is registered as a bundler")
 	}
 
 	names := []string{}
@@ -113,8 +150,34 @@ func TestRegistry(t *testing.T) {
 	if len(names) != 1 || names[0] != "fake" {
 		t.Fatalf("checkers = %v, want [fake]", names)
 	}
-	if b := Bundlers(); len(b) != 1 || b[0].Name() != "esbuild" {
-		t.Fatalf("bundlers = %v, want [esbuild]", b)
+	if b := Bundlers(); len(b) != 1 || b[0].Name() != "pack" {
+		t.Fatalf("bundlers = %v, want [pack]", b)
+	}
+}
+
+func TestSinkKeepsTheTail(t *testing.T) {
+	var s sink
+	for i := 0; i < 10; i++ {
+		if _, err := s.Write([]byte(strings.Repeat("x", bound/2))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Write([]byte("panic: the end")); err != nil {
+		t.Fatal(err)
+	}
+	got := s.text()
+	if len(got) > bound {
+		t.Fatalf("sink held %d bytes, cap is %d", len(got), bound)
+	}
+	if !strings.HasSuffix(got, "panic: the end") {
+		t.Fatalf("the tail was dropped: %q", got[max(0, len(got)-40):])
+	}
+	if s.wrap(errors.New("guest failed")).Error() != "guest failed: "+got {
+		t.Fatalf("wrap = %q", s.wrap(errors.New("guest failed")))
+	}
+	var quiet sink
+	if err := quiet.wrap(errors.New("guest failed")); err.Error() != "guest failed" {
+		t.Fatalf("a silent guest added %q", err)
 	}
 }
 
