@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -32,7 +33,8 @@ type Store interface {
 
 // ErrNoAlloc means the guest did not export the allocator the host needs to
 // hand it a result. It is a contract error, not a runtime one: a module that
-// wants to receive bytes has to provide somewhere to put them.
+// wants to receive bytes has to provide somewhere to put them. The guest traps
+// with it, and the Call that asked returns it.
 var ErrNoAlloc = errors.New("wasm: guest exports no alloc(i32) i32")
 
 // The module a guest imports to reach its Store. One name, because a guest that
@@ -47,41 +49,40 @@ const hostModule = "hanzo"
 // into that. No JSON crosses the boundary — it is bytes and two integers, which
 // is the cheapest thing that can cross and the only shape that cannot disagree
 // about a schema.
+//
+// A number answers the guest's question. A guest that breaks the contract gets
+// no number: an address outside its memory, or a value it asked for with no
+// alloc(i32) i32 to receive it (ErrNoAlloc), traps, and the Call that led there
+// returns why. Answered with -1 instead, a guest bug would read as "absent".
 func (e *Engine) Bind(ctx context.Context, s Store) error {
 	b := e.rt.NewHostModuleBuilder(hostModule)
 
-	// get(keyPtr, keyLen, outPtrPtr) -> length, or -1 when the key is absent.
+	// get(keyPtr, keyLen, outPtrPtr) -> length, with the value's address written
+	// to outPtrPtr; -1 when the key is absent; -2 when the Store failed, which
+	// says nothing about whether the key exists.
+	//
 	// Absence is a VALUE and not a trap: a guest asking whether a file exists is
-	// asking a question, and a trap would make the answer unrecoverable.
+	// asking a question, and a trap would make the answer unrecoverable. A failed
+	// Store is a value too, since the guest may ask again, but never the same
+	// value: "no such object" is an answer and "could not fetch it" is not.
 	b.NewFunctionBuilder().WithFunc(func(ctx context.Context, m api.Module, keyPtr, keyLen, outPtrPtr uint32) int32 {
-		key, ok := readString(m, keyPtr, keyLen)
-		if !ok {
-			return -1
-		}
+		key := readString(m, keyPtr, keyLen)
 		val, err := s.Get(ctx, key)
-		if err != nil || val == nil {
-			return -1
-		}
-		ptr, err := give(ctx, m, val)
 		if err != nil {
+			return -2
+		}
+		if val == nil {
 			return -1
 		}
-		if !m.Memory().WriteUint32Le(outPtrPtr, ptr) {
-			return -1
-		}
+		ptr := give(ctx, m, val)
+		write(m, outPtrPtr, ptr)
 		return int32(len(val))
 	}).Export("get")
 
-	// put(keyPtr, keyLen, valPtr, valLen) -> 0 ok, -1 failed.
+	// put(keyPtr, keyLen, valPtr, valLen) -> 0 ok, -1 when the Store failed.
 	b.NewFunctionBuilder().WithFunc(func(ctx context.Context, m api.Module, keyPtr, keyLen, valPtr, valLen uint32) int32 {
-		key, ok := readString(m, keyPtr, keyLen)
-		if !ok {
-			return -1
-		}
-		val, ok := m.Memory().Read(valPtr, valLen)
-		if !ok {
-			return -1
-		}
+		key := readString(m, keyPtr, keyLen)
+		val := read(m, valPtr, valLen)
 		// COPY before handing it on. The slice above aliases guest memory, which
 		// the guest may rewrite the moment this returns — a store that kept the
 		// slice would persist whatever the guest wrote next.
@@ -93,12 +94,10 @@ func (e *Engine) Bind(ctx context.Context, s Store) error {
 		return 0
 	}).Export("put")
 
-	// list(prefixPtr, prefixLen, outPtrPtr) -> length of a \n-joined list, or -1.
+	// list(prefixPtr, prefixLen, outPtrPtr) -> length of a \n-joined list, with
+	// its address written to outPtrPtr; -1 when the Store failed.
 	b.NewFunctionBuilder().WithFunc(func(ctx context.Context, m api.Module, pfxPtr, pfxLen, outPtrPtr uint32) int32 {
-		pfx, ok := readString(m, pfxPtr, pfxLen)
-		if !ok {
-			return -1
-		}
+		pfx := readString(m, pfxPtr, pfxLen)
 		keys, err := s.List(ctx, pfx)
 		if err != nil {
 			return -1
@@ -110,13 +109,8 @@ func (e *Engine) Bind(ctx context.Context, s Store) error {
 			}
 			flat = append(flat, k...)
 		}
-		ptr, err := give(ctx, m, flat)
-		if err != nil {
-			return -1
-		}
-		if !m.Memory().WriteUint32Le(outPtrPtr, ptr) {
-			return -1
-		}
+		ptr := give(ctx, m, flat)
+		write(m, outPtrPtr, ptr)
 		return int32(len(flat))
 	}).Export("list")
 
@@ -126,32 +120,55 @@ func (e *Engine) Bind(ctx context.Context, s Store) error {
 	return nil
 }
 
-// readString reads a guest string without keeping the guest's memory alive.
-func readString(m api.Module, ptr, n uint32) (string, bool) {
+// read returns n bytes of guest memory at ptr, aliasing it. An address outside
+// that memory traps, as the guest's own out-of-bounds load would.
+//
+// A panic in a host function IS a trap: wazero unwinds the guest and returns the
+// panic value, still wrapped, as the error of the Call that was running. That is
+// how read, write and give refuse, and how ErrNoAlloc reaches errors.Is.
+func read(m api.Module, ptr, n uint32) []byte {
 	b, ok := m.Memory().Read(ptr, n)
 	if !ok {
-		return "", false
+		panic(fmt.Errorf("wasm: %d bytes at %d are outside guest memory", n, ptr))
 	}
-	return string(b), true // string() copies
+	return b
+}
+
+// readString reads a guest string without keeping the guest's memory alive.
+func readString(m api.Module, ptr, n uint32) string {
+	return string(read(m, ptr, n)) // string() copies
+}
+
+// write stores a result's address where the guest asked for it.
+func write(m api.Module, at, ptr uint32) {
+	if !m.Memory().WriteUint32Le(at, ptr) {
+		panic(fmt.Errorf("wasm: result address %d is outside guest memory", at))
+	}
 }
 
 // give asks the guest for space and writes val into it. The guest owns the
 // result afterwards, including freeing it — the host cannot know when a guest is
 // done with a buffer, so it does not pretend to.
-func give(ctx context.Context, m api.Module, val []byte) (uint32, error) {
+func give(ctx context.Context, m api.Module, val []byte) uint32 {
 	alloc := m.ExportedFunction("alloc")
-	if alloc == nil {
-		return 0, ErrNoAlloc
+	if alloc == nil || !isAlloc(alloc.Definition()) {
+		panic(ErrNoAlloc)
 	}
 	res, err := alloc.Call(ctx, uint64(len(val)))
-	if err != nil || len(res) == 0 {
-		return 0, fmt.Errorf("wasm: alloc(%d): %w", len(val), err)
+	if err != nil {
+		panic(fmt.Errorf("wasm: alloc(%d): %w", len(val), err))
 	}
 	ptr := uint32(res[0])
 	if !m.Memory().Write(ptr, val) {
-		return 0, fmt.Errorf("wasm: alloc(%d) returned unwritable memory", len(val))
+		panic(fmt.Errorf("wasm: alloc(%d) returned unwritable memory", len(val)))
 	}
-	return ptr, nil
+	return ptr
+}
+
+// isAlloc reports whether d is alloc(i32) i32, the one signature give can call.
+func isAlloc(d api.FunctionDefinition) bool {
+	i32 := []api.ValueType{api.ValueTypeI32}
+	return slices.Equal(d.ParamTypes(), i32) && slices.Equal(d.ResultTypes(), i32)
 }
 
 // compile-time proof the builder type is what we think it is.

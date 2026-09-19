@@ -61,8 +61,13 @@ sandbox prices rather than container prices.
 The wire is a key as `(ptr,len)` and a result written into guest-allocated
 memory. No JSON crosses the boundary: bytes and two integers is the cheapest
 thing that can cross, and the only shape that cannot disagree about a schema. A
-guest that wants results exports `alloc(i32) i32`; one that does not gets
-`ErrNoAlloc` rather than a silent truncation.
+guest that wants results exports `alloc(i32) i32`; one that does not traps, and
+its `Call` returns `ErrNoAlloc`.
+
+`get` answers -1 for a key that is absent and -2 when the store failed. A
+missing object is an answer; a failed fetch is worth asking again. An address
+outside the guest's memory is not a question, so it traps instead of being
+answered.
 
 ## Limits
 
