@@ -41,7 +41,9 @@ func TestMemory64DefinedOrImported(t *testing.T) {
 			}
 			ctx := context.Background()
 			e, err := New(ctx, Limits{NoWASI: true})
-			if err != nil { t.Fatal(err) }
+			if err != nil {
+				t.Fatal(err)
+			}
 			defer e.Close(ctx)
 			_, err = e.Compile(ctx, tc.code)
 			if tc.is64 && !errors.Is(err, ErrMemory64Unsupported) {
