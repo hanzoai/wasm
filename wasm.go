@@ -136,6 +136,13 @@ type Module struct {
 
 // Compile turns bytes into a Module. It is the slow call; do it once.
 func (e *Engine) Compile(ctx context.Context, src []byte) (*Module, error) {
+	// A wasm64 module cannot run safely with the current wazero backend.
+	// Diagnose this explicitly instead of letting an opaque decoder error
+	// suggest the module is broken. Native wasm2go AOT is a separate,
+	// unsandboxed execution model and must never be selected implicitly.
+	if usesMemory64(src) {
+		return nil, ErrMemory64Unsupported
+	}
 	c, err := e.rt.CompileModule(ctx, src)
 	if err != nil {
 		return nil, fmt.Errorf("wasm: compile: %w", err)
