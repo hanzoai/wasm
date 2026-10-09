@@ -22,5 +22,8 @@ jobs:
           if [ -n "$files" ]; then echo "$files"; exit 1; fi
       - name: Vet
         run: go vet ./...
-      - name: Test with race detector
-        run: go test -race -count=1 ./...
+      # compile/ integration tests require external ESBUILD_WASM and TSGO_WASM
+      # binaries. They intentionally fail rather than falsely skip when absent;
+      # only the self-contained wasm core is covered by this PR workflow.
+      - name: Test sandbox core with race detector
+        run: go test -race -count=1 .
