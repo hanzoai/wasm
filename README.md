@@ -1,5 +1,12 @@
 # wasm
 
+> **Memory64 support:** this repo is a sandboxed wazero wrapper and currently
+> supports 32-bit-indexed guest memory only. A module declaring imported or
+> defined Memory64 returns `ErrMemory64Unsupported`. Hanzo's separate
+> [wasm2go](https://github.com/hanzoai/wasm2go) compiler supports native AOT
+> Memory64; native code is **not** a sandbox replacement. See
+> [MEMORY64.md](MEMORY64.md).
+
 WebAssembly that runs **in the calling process**. A thin wrapper over
 [wazero](https://github.com/tetratelabs/wazero) — not a fork of it.
 
